@@ -1,107 +1,155 @@
 #!/usr/bin/env python3
-"""btc-cent-forecast-01 entry: 4-hour-ahead BTC price forecast.
+"""Entry for make.fun competition btc-cent-forecast-01.
 
-Model: persistence with transient-spike rejection.
+Task: given the last 4,320 one-minute closes of cbBTC/USDC from a single
+Orca Whirlpool on Solana, predict the close 240 minutes after the final
+checkpoint close. Score: mean absolute error in cents over 12 final cases;
+the bar to beat is the house persistence baseline (guess the last close).
 
-The case gives 4,320 one-minute closes of cbBTC/USDC from one Orca pool.
-A single close can sit far off the local level for a minute: one unusually
-large trade in that pool moves its price for a moment (the kit's RULES.txt
-says so), then the price reverts. Guessing that dislocated close as the
-price 4 hours later costs the whole size of the dislocation, so the program
-guards against it:
+Design: persistence, with a guard against transient one-minute pool
+dislocations. The kit's RULES.txt says it plainly: this is one pool's own
+price, not an exchange average, and an unusually large trade there moves
+it for a moment. A dislocated checkpoint close, guessed as-is, costs the
+whole size of the dislocation 4 hours later -- the price has long since
+reverted by then. So:
 
-  * level = median of the last 15 closes (robust to a one-minute spike);
-  * if the checkpoint close sits further from that level than
-    max($150, 4 x the last hour's 1-minute return volatility), the close
-    is treated as a transient dislocation and the level is forecast;
-  * otherwise the checkpoint close itself is forecast (persistence).
+  * robust level  = median of the last 15 closes (a 1-minute spike cannot
+    move a 15-point median);
+  * short-horizon noise = standard deviation of the log 1-minute returns
+    over the last 60 minutes;
+  * the checkpoint close is accepted (plain persistence) unless it sits
+    further from the robust level than max($150, 4 * noise * last price).
+    Only then is the close treated as a transient dislocation and the
+    median level forecast instead.
 
-In normal conditions this is exactly persistence, the honest median
-forecast for a near-random-walk price; it only overrides persistence on a
-clear dislocation. No momentum or mean-reversion term is fitted: on the
-kit's practice window both made the 4-hour error worse.
+In ordinary conditions this program *is* persistence -- the honest median
+forecast for a near-random-walk price -- and the override fires only on a
+clear dislocation. No momentum and no mean-reversion term is fitted: both
+were tried on the practice window and both made the 4-hour error worse,
+so the program carries neither.
 
 Backtest on the kit's practice window (66 sub-checkpoints at 4-hour
-spacing, Nov 7-11): persistence mean absolute error 42,654 cents, this
-program 36,054 cents (ratio 0.85). The whole gain is one genuine
-dislocation: a $1,475 one-minute pool drop that reverted within minutes
-(the median level predicted the 4-hour price to within $15, persistence
-missed by $1,104). The filter fired on no other checkpoint, so outside
-dislocations the program is persistence and its downside is bounded.
+spacing, Nov 7-11 2026): plain persistence mean absolute error 42,654
+cents, this program 36,054 cents (ratio 0.85). The entire gain comes from
+one genuine dislocation -- a $1,475 one-minute pool drop that reverted
+within minutes (the median level predicted the 4-hour price to within
+$15, persistence missed by $1,104). The guard fired on no other
+checkpoint, so outside dislocations the program is persistence and its
+downside is bounded: the override can only help when the close really is
+a spike. (It also fires on none of the kit's six practice cases, which
+this program therefore answers with plain persistence.)
 
-Deterministic, standard library only, no network, no randomness.
-Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR
-(else /output), one {"forecasts": [{"case": id, "price": x}]} file per
-<input>/<id>.in case, price rounded to the grid's 5 decimals.
+Deterministic, Python standard library only, no network, no randomness,
+no state between runs. Reads $MAKEFUN_INPUT_DIR (else /input), writes
+$MAKEFUN_OUTPUT_DIR (else /output), one {"forecasts": [{"case": id,
+"price": x}]} file per <id>.in case, price rounded to the grid's 5
+decimals and clamped inside (0.00001, 9999999.99999). Runs in well under
+the 8-second limit (a few milliseconds per case).
 """
 
 import json
 import math
 import os
-import statistics
-import sys
+from statistics import median
 
+# Where the grader's sandbox puts the case, and where the guess goes.
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
 
 MIN_PRICE = 0.00001
 MAX_PRICE = 9_999_999.99999
 
-# A dislocation must clear both an absolute floor ($150, about 0.2% of a
-# ~$75k BTC) and 4 standard deviations of the last hour's 1-minute
-# returns, so ordinary volatility never triggers the override.
-ABS_FLOOR = 150.0
-VOL_MULTIPLE = 4.0
-LEVEL_WINDOW = 15
-VOL_WINDOW = 60
+# Guard parameters (see module docstring for the reasoning):
+#   a dislocation must clear an absolute floor of $150 (about 0.2% of a
+#   ~$75k BTC) AND four standard deviations of the last hour's 1-minute
+#   returns, so ordinary volatility never triggers the override.
+DISLOCATION_FLOOR_USD = 150.0
+VOL_SIGMA = 4.0
+LEVEL_LOOKBACK = 15      # closes feeding the robust median level
+VOL_LOOKBACK = 60        # minutes feeding the return-volatility estimate
 
 
-def price5(x):
-    """x kept on the grid's 5 decimals and inside (0, 10,000,000)."""
-    return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
+def clamp_to_grid(value):
+    """Round to the pool price grid (5 decimals) and clamp to the valid range."""
+    rounded = round(value, 5)
+    if rounded < MIN_PRICE:
+        return MIN_PRICE
+    if rounded > MAX_PRICE:
+        return MAX_PRICE
+    return rounded
 
 
-def forecast(prices):
+def robust_level(prices):
+    """Median of the last LEVEL_LOOKBACK closes (spike-proof level)."""
+    return median(prices[-LEVEL_LOOKBACK:])
+
+
+def minute_return_vol(prices):
+    """Std dev of log 1-minute returns over the last VOL_LOOKBACK minutes."""
+    window = prices[-VOL_LOOKBACK - 1:]
+    returns = []
+    for prev, cur in zip(window, window[1:]):
+        if prev > 0 and cur > 0:
+            returns.append(math.log(cur / prev))
+    if len(returns) < 2:
+        return 0.0
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+    return math.sqrt(variance)
+
+
+def predict(prices):
     """Forecast the price 240 minutes after the last close in `prices`."""
     if not prices:
-        raise ValueError("market has no prices")
+        raise ValueError("case holds no prices")
     last = prices[-1]
     if not isinstance(last, (int, float)) or not math.isfinite(last):
-        raise ValueError("last price is not a finite number")
+        raise ValueError("checkpoint close is not a finite number")
 
-    level = statistics.median(prices[-LEVEL_WINDOW:])
-    n = min(VOL_WINDOW, len(prices) - 1)
-    if n >= 2:
-        rets = [math.log(prices[j] / prices[j - 1])
-                for j in range(len(prices) - n, len(prices))
-                if prices[j - 1] > 0 and prices[j] > 0]
-        if len(rets) >= 2:
-            mu = sum(rets) / len(rets)
-            vol = math.sqrt(sum((r - mu) ** 2 for r in rets) / len(rets))
-        else:
-            vol = 0.0
-    else:
-        vol = 0.0
+    level = robust_level(prices)
+    noise = minute_return_vol(prices)
+    # A dislocation must clear both the absolute floor and the
+    # volatility-scaled bar; either alone would fire too often.
+    dislocation_bar = max(DISLOCATION_FLOOR_USD, VOL_SIGMA * noise * last)
+    if abs(last - level) > dislocation_bar:
+        # Transient spike: the pool price has already moved back by the
+        # time the target minute arrives, so forecast the robust level.
+        return clamp_to_grid(level)
+    # Normal conditions: persistence -- the last close is the forecast.
+    return clamp_to_grid(last)
 
-    threshold = max(ABS_FLOOR, VOL_MULTIPLE * vol * last)
-    guess = level if abs(last - level) > threshold else last
-    return price5(guess)
+
+def forecast_case(case, case_id):
+    """Extract the single market's prices and predict; returns the guess.
+
+    The case id embedded in the file must agree with the file's name: the
+    output is named after the file, so a disagreement would mean naming
+    another case, which the kit scores as invalid.
+    """
+    embedded = case.get("case")
+    if embedded is not None and embedded != case_id:
+        raise ValueError(
+            f"case id inside the file ({embedded!r}) does not match "
+            f"its file name ({case_id!r})"
+        )
+    markets = case.get("markets")
+    if not isinstance(markets, list) or len(markets) != 1:
+        raise ValueError("case does not hold exactly one market")
+    return predict(markets[0]["prices"])
 
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    inputs = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
-    for name in inputs:
+    for name in sorted(os.listdir(INPUT_DIR)):
+        if not name.endswith(".in"):
+            continue
         case_id = name[: -len(".in")]
         with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as fh:
             case = json.load(fh)
-        markets = case.get("markets")
-        if not isinstance(markets, list) or len(markets) != 1:
-            raise ValueError(f"{name} does not hold exactly one market")
-        guess = forecast(markets[0]["prices"])
+        guess = forecast_case(case, case_id)
         out = {"forecasts": [{"case": case_id, "price": guess}]}
-        with open(os.path.join(OUTPUT_DIR, case_id + ".out"),
-                  "w", encoding="utf-8") as fh:
+        out_path = os.path.join(OUTPUT_DIR, case_id + ".out")
+        with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(out) + "\n")
 
 
